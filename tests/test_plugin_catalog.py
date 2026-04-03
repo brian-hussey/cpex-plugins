@@ -24,6 +24,30 @@ def run_catalog(*args: str, cwd: Path | None = None) -> subprocess.CompletedProc
 
 
 class PluginCatalogTests(unittest.TestCase):
+    def _extract_workflow_job_section(self, workflow: str, job_name: str) -> str:
+        lines = workflow.splitlines()
+        in_jobs = False
+        job_header = f"  {job_name}:"
+        section_lines: list[str] = []
+
+        for line in lines:
+            if line == "jobs:":
+                in_jobs = True
+                continue
+            if not in_jobs:
+                continue
+            if line.startswith("  ") and not line.startswith("    "):
+                if section_lines:
+                    break
+                if line == job_header:
+                    section_lines.append(line)
+                continue
+            if section_lines:
+                section_lines.append(line)
+
+        self.assertTrue(section_lines, f"expected to find workflow job {job_name!r}")
+        return "\n".join(section_lines) + "\n"
+
     def _source_tree_has_extension(self, package_dir: Path, module_name: str) -> bool:
         return any(package_dir.glob(f"{module_name}*.so")) or any(
             package_dir.glob(f"{module_name}*.pyd")
@@ -489,6 +513,23 @@ class PluginCatalogTests(unittest.TestCase):
             ],
         )
 
+    def test_release_info_gives_pii_filter_the_same_target_matrix(self) -> None:
+        result = run_catalog("release-info", str(REPO_ROOT), "pii-filter-v0.2.0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["slug"], "pii_filter")
+        self.assertEqual(
+            payload["release_wheel_matrix"],
+            [
+                {"runner": "ubuntu-latest", "platform": "linux-x86_64"},
+                {"runner": "ubuntu-24.04-arm", "platform": "linux-aarch64"},
+                {"runner": "ubuntu-24.04-s390x", "platform": "linux-s390x"},
+                {"runner": "ubuntu-24.04-ppc64le", "platform": "linux-ppc64le"},
+                {"runner": "macos-latest", "platform": "macos-arm64"},
+                {"runner": "windows-latest", "platform": "windows-x86_64"},
+            ],
+        )
+
     def test_release_info_rejects_noncanonical_tag(self) -> None:
         result = run_catalog("release-info", str(REPO_ROOT), "rate_limiter-v0.0.3")
         self.assertNotEqual(result.returncode, 0)
@@ -787,6 +828,8 @@ class PluginCatalogTests(unittest.TestCase):
         workflow = (
             REPO_ROOT / ".github" / "workflows" / "release-rust-python-package.yaml"
         ).read_text()
+        preflight_section = self._extract_workflow_job_section(workflow, "preflight")
+        build_wheel_section = self._extract_workflow_job_section(workflow, "build-wheel")
         self.assertIn("preflight:", workflow)
         self.assertIn("needs: [resolve, preflight]", workflow)
         self.assertIn("shell: bash", workflow)
@@ -807,6 +850,28 @@ class PluginCatalogTests(unittest.TestCase):
         self.assertIn("matrix:\n        include: ${{ fromJson(needs.resolve.outputs.wheel_matrix) }}", workflow)
         self.assertIn("runs-on: ${{ matrix.runner }}", workflow)
         self.assertIn("name: wheel-${{ matrix.platform }}", workflow)
+        self.assertNotIn("matrix.", preflight_section)
+        self.assertIn(
+            "matrix.runner != 'ubuntu-24.04-s390x' && matrix.runner != 'ubuntu-24.04-ppc64le'",
+            build_wheel_section,
+        )
+        self.assertIn(
+            "matrix.runner == 'ubuntu-24.04-s390x' || matrix.runner == 'ubuntu-24.04-ppc64le'",
+            build_wheel_section,
+        )
+        self.assertIn(
+            "sudo apt-get install -y python3.12 python3.12-dev python3.12-venv",
+            build_wheel_section,
+        )
+        self.assertIn(
+            'ln -sf "$(which python3.12)" "${python_bin_dir}/python"',
+            build_wheel_section,
+        )
+        self.assertIn("sudo apt-get clean", build_wheel_section)
+        self.assertIn("sudo rm -rf /var/lib/apt/lists/*", build_wheel_section)
+        self.assertIn('export PATH="${python_bin_dir}:$PATH"', build_wheel_section)
+        self.assertIn('python -m ensurepip --upgrade', build_wheel_section)
+        self.assertNotIn("python -m pip install --upgrade pip", build_wheel_section)
         self.assertNotIn("tools/plugin_catalog.py release-info-field", workflow)
         self.assertNotIn("python3 - <<'PY'", workflow)
         self.assertIn("uv==0.9.30", workflow)

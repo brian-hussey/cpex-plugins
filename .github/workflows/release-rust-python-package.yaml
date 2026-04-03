@@ -123,8 +123,24 @@ jobs:
           ref: ${{ needs.resolve.outputs.checkout_ref }}
 
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        if: ${{ matrix.runner != 'ubuntu-24.04-s390x' && matrix.runner != 'ubuntu-24.04-ppc64le' }}
         with:
           python-version: "3.12"
+
+      - name: Install system Python on partner runners
+        if: ${{ matrix.runner == 'ubuntu-24.04-s390x' || matrix.runner == 'ubuntu-24.04-ppc64le' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3.12 python3.12-dev python3.12-venv
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+          python_bin_dir="${RUNNER_TEMP}/python-bin"
+          mkdir -p "${python_bin_dir}"
+          ln -sf "$(which python3.12)" "${python_bin_dir}/python"
+          export PATH="${python_bin_dir}:$PATH"
+          echo "${python_bin_dir}" >> "$GITHUB_PATH"
+          python --version
+          python -m ensurepip --upgrade
 
       - name: Verify Rust toolchain
         run: |

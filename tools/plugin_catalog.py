@@ -42,19 +42,12 @@ class PluginRecord:
     release_wheel_matrix: list[dict[str, str]]
 
 
-def _release_wheel_matrix(slug: str) -> list[dict[str, str]]:
-    if slug == "rate_limiter":
-        return [
-            {"runner": "ubuntu-latest", "platform": "linux-x86_64"},
-            {"runner": "ubuntu-24.04-arm", "platform": "linux-aarch64"},
-            {"runner": "ubuntu-24.04-s390x", "platform": "linux-s390x"},
-            {"runner": "ubuntu-24.04-ppc64le", "platform": "linux-ppc64le"},
-            {"runner": "macos-latest", "platform": "macos-arm64"},
-            {"runner": "windows-latest", "platform": "windows-x86_64"},
-        ]
-
+def _release_wheel_matrix() -> list[dict[str, str]]:
     return [
         {"runner": "ubuntu-latest", "platform": "linux-x86_64"},
+        {"runner": "ubuntu-24.04-arm", "platform": "linux-aarch64"},
+        {"runner": "ubuntu-24.04-s390x", "platform": "linux-s390x"},
+        {"runner": "ubuntu-24.04-ppc64le", "platform": "linux-ppc64le"},
         {"runner": "macos-latest", "platform": "macos-arm64"},
         {"runner": "windows-latest", "platform": "windows-x86_64"},
     ]
@@ -243,7 +236,7 @@ def validate_plugin_dir(
         package_name=expected_package_name,
         module_name=expected_module_name,
         version=version,
-        release_wheel_matrix=_release_wheel_matrix(slug),
+        release_wheel_matrix=_release_wheel_matrix(),
     )
 
 
