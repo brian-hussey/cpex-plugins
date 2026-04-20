@@ -7,7 +7,8 @@ use pyo3::types::{PyAny, PyDict, PyModule};
 use pyo3_stub_gen::derive::*;
 
 use crate::config::SecretsDetectionConfig;
-use crate::scan_container;
+use crate::object_model::copy_object_with_updates;
+use crate::scanner::scan_container;
 
 #[gen_stub_pyclass]
 #[pyclass]
@@ -32,29 +33,31 @@ impl SecretsDetectionPluginCore {
         _context: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
         let args = payload.getattr("args")?;
-        let source = if args.is_none() {
-            PyDict::new(py).into_any()
-        } else {
-            args
-        };
-        let (count, redacted, findings) = scan_container(py, &source, &self.config)?;
+        let (count, redacted_args, findings) = scan_container(py, &args, &self.config)?;
         if self.should_block(count) {
+            let modified_payload = if self.config.redact && count > 0 {
+                copy_with_update(py, payload, [("args", redacted_args.clone().unbind())])?
+            } else {
+                payload.clone().unbind()
+            };
             return blocked_result(
                 py,
                 "PromptPrehookResult",
                 "Potential secrets detected in prompt arguments",
                 count,
                 findings.as_any(),
+                modified_payload,
             );
         }
 
         if self.config.redact && count > 0 {
-            payload.setattr("args", &redacted)?;
+            let modified_payload =
+                copy_with_update(py, payload, [("args", redacted_args.unbind())])?;
             return build_framework_object(
                 py,
                 "PromptPrehookResult",
                 [
-                    ("modified_payload", payload.clone().unbind()),
+                    ("modified_payload", modified_payload),
                     (
                         "metadata",
                         redaction_metadata(py, count)?.into_any().unbind(),
@@ -86,24 +89,31 @@ impl SecretsDetectionPluginCore {
         _context: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
         let value = payload.getattr("result")?;
-        let (count, redacted, findings) = scan_container(py, &value, &self.config)?;
+        let (count, redacted_result, findings) = scan_container(py, &value, &self.config)?;
         if self.should_block(count) {
+            let modified_payload = if self.config.redact && count > 0 {
+                copy_with_update(py, payload, [("result", redacted_result.clone().unbind())])?
+            } else {
+                payload.clone().unbind()
+            };
             return blocked_result(
                 py,
                 "ToolPostInvokeResult",
                 "Potential secrets detected in tool result",
                 count,
                 findings.as_any(),
+                modified_payload,
             );
         }
 
         if self.config.redact && count > 0 {
-            payload.setattr("result", &redacted)?;
+            let modified_payload =
+                copy_with_update(py, payload, [("result", redacted_result.unbind())])?;
             return build_framework_object(
                 py,
                 "ToolPostInvokeResult",
                 [
-                    ("modified_payload", payload.clone().unbind()),
+                    ("modified_payload", modified_payload),
                     (
                         "metadata",
                         redaction_metadata(py, count)?.into_any().unbind(),
@@ -138,24 +148,34 @@ impl SecretsDetectionPluginCore {
         let Ok(text) = content.getattr("text") else {
             return default_result(py, "ResourcePostFetchResult");
         };
-        let (count, redacted, findings) = scan_container(py, &text, &self.config)?;
+        let (count, redacted_text, findings) = scan_container(py, &text, &self.config)?;
         if self.should_block(count) {
+            let modified_payload = if self.config.redact && count > 0 {
+                let modified_content =
+                    copy_with_update(py, &content, [("text", redacted_text.clone().unbind())])?;
+                copy_with_update(py, payload, [("content", modified_content)])?
+            } else {
+                payload.clone().unbind()
+            };
             return blocked_result(
                 py,
                 "ResourcePostFetchResult",
                 "Potential secrets detected in resource content",
                 count,
                 findings.as_any(),
+                modified_payload,
             );
         }
 
         if self.config.redact && count > 0 {
-            content.setattr("text", &redacted)?;
+            let modified_content =
+                copy_with_update(py, &content, [("text", redacted_text.unbind())])?;
+            let modified_payload = copy_with_update(py, payload, [("content", modified_content)])?;
             return build_framework_object(
                 py,
                 "ResourcePostFetchResult",
                 [
-                    ("modified_payload", payload.clone().unbind()),
+                    ("modified_payload", modified_payload),
                     (
                         "metadata",
                         redaction_metadata(py, count)?.into_any().unbind(),
@@ -200,7 +220,7 @@ fn findings_metadata<'py>(
     findings: &Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let metadata = PyDict::new(py);
-    metadata.set_item("secrets_findings", findings)?;
+    metadata.set_item("secrets_findings", sanitized_findings(py, findings)?)?;
     metadata.set_item("count", count)?;
     Ok(metadata)
 }
@@ -211,10 +231,11 @@ fn blocked_result(
     description: &str,
     count: usize,
     findings: &Bound<'_, PyAny>,
+    payload: Py<PyAny>,
 ) -> PyResult<Py<PyAny>> {
     let details = PyDict::new(py);
     details.set_item("count", count)?;
-    details.set_item("examples", findings)?;
+    details.set_item("examples", sanitized_findings(py, findings)?)?;
     build_framework_object(
         py,
         result_class,
@@ -245,8 +266,39 @@ fn blocked_result(
                     ],
                 )?,
             ),
+            ("modified_payload", payload),
         ],
     )
+}
+
+fn copy_with_update<const N: usize>(
+    py: Python<'_>,
+    obj: &Bound<'_, PyAny>,
+    updates: [(&str, Py<PyAny>); N],
+) -> PyResult<Py<PyAny>> {
+    let update_dict = PyDict::new(py);
+    for (key, value) in updates {
+        update_dict.set_item(key, value.bind(py))?;
+    }
+    copy_object_with_updates(py, obj, &update_dict)
+}
+
+fn sanitized_findings<'py>(
+    py: Python<'py>,
+    findings: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let out = pyo3::types::PyList::empty(py);
+    for item in findings.try_iter()? {
+        let item = item?;
+        if let Ok(dict) = item.cast::<PyDict>()
+            && let Some(kind) = dict.get_item("type")?
+        {
+            let sanitized = PyDict::new(py);
+            sanitized.set_item("type", kind)?;
+            out.append(sanitized)?;
+        }
+    }
+    Ok(out.into_any())
 }
 
 #[allow(dead_code)]

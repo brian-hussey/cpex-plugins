@@ -1,101 +1,59 @@
 // Copyright 2026
 // SPDX-License-Identifier: Apache-2.0
 
-use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyDict, PyList, PyString};
+#[cfg(test)]
+use serde_json::{Map, Value};
 
+#[cfg(test)]
 use crate::config::SecretsDetectionConfig;
-use crate::patterns::PATTERNS;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Finding {
-    pub pii_type: String,
-    pub preview: String,
-}
+mod cycle_rewrite;
+mod python_scan;
+mod text_scan;
 
-pub fn scan_container<'py>(
-    py: Python<'py>,
-    container: &Bound<'py, PyAny>,
-    config: &SecretsDetectionConfig,
-) -> PyResult<(usize, Bound<'py, PyAny>, Bound<'py, PyList>)> {
-    let findings = PyList::empty(py);
+pub use python_scan::scan_container;
+pub use text_scan::detect_and_redact;
 
-    if let Ok(text) = container.extract::<String>() {
-        let (matches, redacted) = detect_and_redact(&text, config);
-        for finding in &matches {
-            let finding_dict = PyDict::new(py);
-            finding_dict.set_item("type", &finding.pii_type)?;
-            finding_dict.set_item("match", &finding.preview)?;
-            findings.append(finding_dict)?;
+#[cfg(test)]
+use text_scan::Finding;
+
+#[cfg(test)]
+fn scan_value(value: &Value, config: &SecretsDetectionConfig) -> (usize, Value, Vec<Finding>) {
+    match value {
+        Value::String(text) => {
+            let (matches, redacted) = detect_and_redact(text, config);
+            (matches.len(), Value::String(redacted), matches)
         }
-        return Ok((
-            matches.len(),
-            PyString::new(py, &redacted).into_any(),
-            findings,
-        ));
-    }
+        Value::Array(items) => {
+            let mut total = 0usize;
+            let mut redacted_items = Vec::with_capacity(items.len());
+            let mut findings = Vec::new();
 
-    if let Ok(dict) = container.cast::<PyDict>() {
-        let new_dict = PyDict::new(py);
-        let mut total = 0usize;
-        for (key, value) in dict.iter() {
-            let (count, redacted_value, child_findings) = scan_container(py, &value, config)?;
-            total += count;
-            for finding in child_findings.iter() {
-                findings.append(finding)?;
+            for item in items {
+                let (count, redacted_item, mut child_findings) = scan_value(item, config);
+                total += count;
+                redacted_items.push(redacted_item);
+                findings.append(&mut child_findings);
             }
-            new_dict.set_item(key, redacted_value)?;
-        }
-        return Ok((total, new_dict.into_any(), findings));
-    }
 
-    if let Ok(list) = container.cast::<PyList>() {
-        let new_list = PyList::empty(py);
-        let mut total = 0usize;
-        for item in list.iter() {
-            let (count, redacted_item, child_findings) = scan_container(py, &item, config)?;
-            total += count;
-            for finding in child_findings.iter() {
-                findings.append(finding)?;
+            (total, Value::Array(redacted_items), findings)
+        }
+        Value::Object(entries) => {
+            let mut total = 0usize;
+            let mut redacted_entries = Map::with_capacity(entries.len());
+            let mut findings = Vec::new();
+
+            for (key, value) in entries {
+                let (count, redacted_value, mut child_findings) = scan_value(value, config);
+                total += count;
+                redacted_entries.insert(key.clone(), redacted_value);
+                findings.append(&mut child_findings);
             }
-            new_list.append(redacted_item)?;
+
+            (total, Value::Object(redacted_entries), findings)
         }
-        return Ok((total, new_list.into_any(), findings));
+        _ => (0, value.clone(), Vec::new()),
     }
-
-    Ok((0, container.clone(), findings))
-}
-
-pub fn detect_and_redact(text: &str, config: &SecretsDetectionConfig) -> (Vec<Finding>, String) {
-    let mut findings = Vec::new();
-    let mut redacted = text.to_string();
-
-    for (name, pattern) in PATTERNS.iter() {
-        if !config.is_enabled(name) {
-            continue;
-        }
-
-        for matched in pattern.find_iter(text) {
-            let text = matched.as_str();
-            let preview = if text.chars().count() > 8 {
-                format!("{}…", text.chars().take(8).collect::<String>())
-            } else {
-                text.to_string()
-            };
-            findings.push(Finding {
-                pii_type: name.to_string(),
-                preview,
-            });
-        }
-
-        if config.redact {
-            redacted = pattern
-                .replace_all(&redacted, config.redaction_text.as_str())
-                .into_owned();
-        }
-    }
-
-    (findings, redacted)
 }
 
 #[cfg(test)]
@@ -103,7 +61,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn redacts_aws_keys() {
+    fn detects_aws_secret_access_key() {
+        let config = SecretsDetectionConfig::default();
+        let (findings, _) = detect_and_redact(
+            "AWS_SECRET_ACCESS_KEY=FAKESecretAccessKeyForTestingEXAMPLE0000",
+            &config,
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.pii_type == "aws_secret_access_key")
+        );
+    }
+
+    #[test]
+    fn detects_slack_token() {
+        let config = SecretsDetectionConfig::default();
+        let (findings, _) = detect_and_redact(
+            "xoxr-fake-000000000-fake000000000-fakefakefakefake",
+            &config,
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.pii_type == "slack_token")
+        );
+    }
+
+    #[test]
+    fn redaction_works() {
         let config = SecretsDetectionConfig {
             redact: true,
             redaction_text: "[REDACTED]".to_string(),
@@ -116,6 +102,82 @@ mod tests {
     }
 
     #[test]
+    fn handles_nested_structures() {
+        let redact_config = SecretsDetectionConfig {
+            redact: true,
+            redaction_text: "[REDACTED]".to_string(),
+            ..SecretsDetectionConfig::default()
+        };
+        let value = Value::Object(Map::from_iter([(
+            "users".to_string(),
+            Value::Array(vec![
+                Value::Object(Map::from_iter([
+                    ("name".to_string(), Value::String("Alice".to_string())),
+                    (
+                        "key".to_string(),
+                        Value::String("AKIAFAKE12345EXAMPLE".to_string()),
+                    ),
+                ])),
+                Value::Object(Map::from_iter([
+                    ("name".to_string(), Value::String("Bob".to_string())),
+                    (
+                        "token".to_string(),
+                        Value::String(
+                            "xoxr-fake-000000000-fake000000000-fakefakefakefake".to_string(),
+                        ),
+                    ),
+                ])),
+            ]),
+        )]));
+
+        let (count, redacted, findings) = scan_value(&value, &redact_config);
+
+        assert_eq!(count, 2);
+        assert_eq!(
+            redacted,
+            Value::Object(Map::from_iter([(
+                "users".to_string(),
+                Value::Array(vec![
+                    Value::Object(Map::from_iter([
+                        ("name".to_string(), Value::String("Alice".to_string())),
+                        ("key".to_string(), Value::String("[REDACTED]".to_string())),
+                    ])),
+                    Value::Object(Map::from_iter([
+                        ("name".to_string(), Value::String("Bob".to_string())),
+                        ("token".to_string(), Value::String("[REDACTED]".to_string())),
+                    ])),
+                ]),
+            )]))
+        );
+        assert_eq!(findings.len(), 2);
+        let finding_types: std::collections::HashSet<_> = findings
+            .iter()
+            .map(|finding| finding.pii_type.as_str())
+            .collect();
+        assert_eq!(
+            finding_types,
+            std::collections::HashSet::from(["aws_access_key_id", "slack_token"])
+        );
+    }
+
+    #[test]
+    fn generic_api_key_assignment_detection_is_opt_in() {
+        let config = SecretsDetectionConfig {
+            enabled: std::collections::HashMap::from([(
+                "generic_api_key_assignment".to_string(),
+                true,
+            )]),
+            ..Default::default()
+        };
+        let (findings, _) = detect_and_redact("X-API-Key: test12345678901234567890", &config);
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.pii_type == "generic_api_key_assignment")
+        );
+    }
+
+    #[test]
     fn broad_patterns_are_opt_in() {
         let config = SecretsDetectionConfig {
             redact: true,
@@ -125,5 +187,30 @@ mod tests {
             detect_and_redact("access_token = 'abcdefghijklmnopqrstuvwx'", &config);
         assert!(findings.is_empty());
         assert_eq!(redacted, "access_token = 'abcdefghijklmnopqrstuvwx'");
+    }
+
+    #[test]
+    fn generic_api_key_assignment_ignores_short_or_prose_values() {
+        let config = SecretsDetectionConfig {
+            enabled: std::collections::HashMap::from([(
+                "generic_api_key_assignment".to_string(),
+                true,
+            )]),
+            ..Default::default()
+        };
+
+        for text in [
+            "api_key=short",
+            "api key rotation is enabled",
+            "The api_key field is documented below",
+        ] {
+            let (findings, _) = detect_and_redact(text, &config);
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| finding.pii_type != "generic_api_key_assignment"),
+                "{text}"
+            );
+        }
     }
 }

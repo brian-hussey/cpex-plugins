@@ -11,9 +11,10 @@ use pyo3_stub_gen::define_stub_info_gatherer;
 use pyo3_stub_gen::derive::*;
 
 pub mod config;
+pub mod object_model;
 pub mod patterns;
 pub mod plugin;
-pub mod scanner;
+mod scanner;
 
 pub use config::SecretsDetectionConfig;
 pub use scanner::{detect_and_redact, scan_container};
