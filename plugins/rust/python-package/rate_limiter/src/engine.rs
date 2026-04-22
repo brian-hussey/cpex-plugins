@@ -77,6 +77,16 @@ impl RateLimiterEngine {
     pub fn uses_async_backend(&self) -> bool {
         matches!(self.backend, EngineBackend::Redis(_))
     }
+
+    /// Release backend-held resources. For Redis, this drops the cached
+    /// multiplexed connection so the server can close the socket; in-flight
+    /// requests that already cloned the handle remain valid. Memory backend
+    /// has no external resources and is a no-op.
+    pub fn shutdown(&self) {
+        if let EngineBackend::Redis(redis) = &self.backend {
+            redis.shutdown();
+        }
+    }
 }
 
 #[gen_stub_pymethods]
@@ -91,8 +101,17 @@ impl RateLimiterEngine {
     /// - `backend`: `"memory"` (default) or `"redis"`
     /// - `redis_url`: required when `backend = "redis"`
     /// - `redis_key_prefix`: key namespace prefix (default `"rl"`)
+    /// - `fail_mode`: `"open"` (default) or `"closed"` — handled by the
+    ///   plugin shim, but accepted here so it doesn't trip the unknown-key
+    ///   warning below.
+    ///
+    /// Any other key in the dict is logged at WARN so misspellings (e.g.
+    /// `redis_ur` instead of `redis_url`) surface visibly instead of being
+    /// silently ignored.
     #[new]
     pub fn new(config: &Bound<'_, PyDict>) -> PyResult<Self> {
+        warn_on_unknown_config_keys(config);
+
         let by_user: Option<String> = config.get_item("by_user")?.and_then(|v| v.extract().ok());
         let by_tenant: Option<String> =
             config.get_item("by_tenant")?.and_then(|v| v.extract().ok());
@@ -161,11 +180,17 @@ impl RateLimiterEngine {
     ///
     /// Returns `(allowed, headers_dict, meta_dict)`.
     ///
+    /// When `context_prefix` is provided (e.g. a team/tenant ID), it is
+    /// prepended to every dimension key so that separate plugin instances
+    /// for different tenants use isolated Redis counters instead of sharing
+    /// a single key namespace.
+    ///
     /// **Note:** The Redis backend arm uses `block_on()` on a dedicated Tokio
     /// runtime, which would deadlock if called from within a Tokio context.
     /// The Python wrapper routes Redis to `check_async()` instead; this sync
     /// path is intended for the memory backend.  The `debug_assert` below
     /// guards against accidental misuse.
+    #[allow(clippy::too_many_arguments)]
     pub fn check<'py>(
         &self,
         py: Python<'py>,
@@ -174,13 +199,14 @@ impl RateLimiterEngine {
         tool: &str,
         now_unix: i64,
         include_retry_after: bool,
+        context_prefix: Option<&str>,
     ) -> PyResult<(bool, Bound<'py, PyDict>, Bound<'py, PyDict>)> {
         if matches!(self.backend, EngineBackend::Redis(_)) {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "check() must not be called with the Redis backend — use check_async() instead",
             ));
         }
-        let checks = self.build_checks(user, tenant, tool);
+        let checks = self.build_checks(user, tenant, tool, context_prefix);
         if checks.is_empty() {
             let headers = PyDict::new(py);
             let meta = PyDict::new(py);
@@ -216,13 +242,14 @@ impl RateLimiterEngine {
 
         let eval = EvalResult::from_dims(&dim_results);
         let headers = build_headers_dict(py, &eval, include_retry_after)?;
-        let meta = build_meta_dict(py, &eval, now_unix)?;
+        let meta = build_meta_dict(py, &eval, now_unix, Some(user), tenant)?;
         Ok((eval.allowed, headers, meta))
     }
 
     /// Async variant of `check()` for Redis-backed deployments.
     ///
     /// Returns an awaitable that resolves to `(allowed, headers_dict, meta_dict)`.
+    #[allow(clippy::too_many_arguments)]
     pub fn check_async<'py>(
         &self,
         py: Python<'py>,
@@ -231,8 +258,9 @@ impl RateLimiterEngine {
         tool: &str,
         now_unix: i64,
         include_retry_after: bool,
+        context_prefix: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let checks = self.build_checks(user, tenant, tool);
+        let checks = self.build_checks(user, tenant, tool, context_prefix);
         if checks.is_empty() {
             return future_into_py(py, async move {
                 Python::attach(|py| -> PyResult<Py<PyAny>> {
@@ -255,6 +283,10 @@ impl RateLimiterEngine {
         let backend = self.backend.clone();
         let algorithm = self.config.algorithm;
         let clock = Arc::clone(&self.clock);
+        // Capture identity as owned for the async move so build_meta_dict
+        // can surface tenant_id/user_id in violation details (G7).
+        let user_owned = user.to_string();
+        let tenant_owned = tenant.map(|s| s.to_string());
 
         future_into_py(py, async move {
             let dim_results: Vec<DimResult> =
@@ -284,7 +316,13 @@ impl RateLimiterEngine {
             let eval = EvalResult::from_dims(&dim_results);
             Python::attach(|py| -> PyResult<Py<PyAny>> {
                 let headers = build_headers_dict(py, &eval, include_retry_after)?;
-                let meta = build_meta_dict(py, &eval, now_unix)?;
+                let meta = build_meta_dict(
+                    py,
+                    &eval,
+                    now_unix,
+                    Some(user_owned.as_str()),
+                    tenant_owned.as_deref(),
+                )?;
                 let tup = pyo3::types::PyTuple::new(
                     py,
                     [
@@ -306,25 +344,80 @@ impl RateLimiterEngine {
 impl RateLimiterEngine {
     /// Build dimension checks from engine config.
     /// Mirrors Python `_build_rust_checks()` but runs in Rust.
+    ///
+    /// When `context_prefix` is `Some("team_a")` the keys become
+    /// `team_a:user:alice`, `team_a:tenant:team_a`, `team_a:tool:search`
+    /// instead of the unprefixed versions. This prevents counter collisions
+    /// across plugin-manager contexts (teams) that share the same Redis.
     fn build_checks(
         &self,
         user: &str,
         tenant: Option<&str>,
         tool: &str,
+        context_prefix: Option<&str>,
     ) -> Vec<(String, u64, u64)> {
         let mut checks = Vec::with_capacity(3);
+        let pfx = context_prefix.unwrap_or("");
         if let Some(ref rl) = self.config.by_user {
-            checks.push((format!("user:{}", user), rl.count, rl.window_nanos));
+            let key = if pfx.is_empty() {
+                format!("user:{}", user)
+            } else {
+                format!("{}:user:{}", pfx, user)
+            };
+            checks.push((key, rl.count, rl.window_nanos));
         }
         if let (Some(t), Some(rl)) = (tenant, &self.config.by_tenant) {
-            checks.push((format!("tenant:{}", t), rl.count, rl.window_nanos));
+            let key = if pfx.is_empty() {
+                format!("tenant:{}", t)
+            } else {
+                format!("{}:tenant:{}", pfx, t)
+            };
+            checks.push((key, rl.count, rl.window_nanos));
         }
         // Tool names are already normalised (lowercase) in EngineConfig at init time.
         // The caller passes the already-lowercased tool name from Python.
         if let Some(rl) = self.config.by_tool.get(tool) {
-            checks.push((format!("tool:{}", tool), rl.count, rl.window_nanos));
+            let key = if pfx.is_empty() {
+                format!("tool:{}", tool)
+            } else {
+                format!("{}:tool:{}", pfx, tool)
+            };
+            checks.push((key, rl.count, rl.window_nanos));
         }
         checks
+    }
+}
+
+/// Emit a single WARN-level log listing config keys we don't recognise.
+/// Catches misspellings (e.g. ``redis_ur`` instead of ``redis_url``) that
+/// would otherwise silently default and surprise the operator at runtime.
+fn warn_on_unknown_config_keys(config: &Bound<'_, PyDict>) {
+    const KNOWN: &[&str] = &[
+        "by_user",
+        "by_tenant",
+        "by_tool",
+        "algorithm",
+        "backend",
+        "redis_url",
+        "redis_key_prefix",
+        "fail_mode",
+    ];
+    let mut unknown: Vec<String> = Vec::new();
+    for (key, _) in config.iter() {
+        let Ok(name) = key.extract::<String>() else {
+            continue;
+        };
+        if !KNOWN.contains(&name.as_str()) {
+            unknown.push(name);
+        }
+    }
+    if !unknown.is_empty() {
+        unknown.sort();
+        warn!(
+            "rate limiter: unknown config key(s): {}; expected one of: {}",
+            unknown.join(", "),
+            KNOWN.join(", "),
+        );
     }
 }
 
@@ -349,10 +442,18 @@ fn build_headers_dict<'py>(
 }
 
 /// Build metadata dict — mirrors Python `_rust_to_plugin_meta()`.
+///
+/// When a request is blocked, identity (`user_id` / `tenant_id`) is
+/// surfaced in the meta dict so the resulting `PluginViolation.details`
+/// carries enough context for downstream debugging (G7). Identity is
+/// intentionally NOT attached on allowed responses to avoid widening
+/// identity exposure to every metadata consumer on the hot path.
 fn build_meta_dict<'py>(
     py: Python<'py>,
     eval: &EvalResult,
     now_unix: i64,
+    user: Option<&str>,
+    tenant: Option<&str>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let meta = PyDict::new(py);
     let reset_in = eval
@@ -361,6 +462,14 @@ fn build_meta_dict<'py>(
     meta.set_item("limited", true)?;
     meta.set_item("remaining", eval.remaining)?;
     meta.set_item("reset_in", reset_in)?;
+    if !eval.allowed {
+        if let Some(u) = user.filter(|s| !s.is_empty()) {
+            meta.set_item("user_id", u)?;
+        }
+        if let Some(t) = tenant.filter(|s| !s.is_empty()) {
+            meta.set_item("tenant_id", t)?;
+        }
+    }
 
     let has_violated = !eval.violated_dimensions.is_empty();
     let has_allowed = !eval.allowed_dimensions.is_empty();
@@ -558,5 +667,76 @@ mod tests {
         let _ = engine.evaluate_many(checks(), 1_000_000).unwrap();
         let result = engine.evaluate_many(checks(), 1_000_000).unwrap();
         assert!(!result.allowed); // tenant exhausted → blocked
+    }
+
+    // --- Context prefix: tenant-scoped key isolation ---
+
+    #[test]
+    fn build_checks_without_prefix_produces_unprefixed_keys() {
+        let (engine, _handle) = engine_with_fake_clock(Some("10/s"), Algorithm::FixedWindow);
+        let checks = engine.build_checks("alice", Some("acme"), "search", None);
+        let keys: Vec<&str> = checks.iter().map(|(k, _, _)| k.as_str()).collect();
+        assert!(keys.contains(&"user:alice"));
+        assert!(keys.contains(&"tool:search"));
+    }
+
+    #[test]
+    fn build_checks_with_prefix_prepends_to_all_keys() {
+        let (engine, _handle) = engine_with_fake_clock(Some("10/s"), Algorithm::FixedWindow);
+        let checks = engine.build_checks("alice", Some("acme"), "search", Some("team_a"));
+        let keys: Vec<&str> = checks.iter().map(|(k, _, _)| k.as_str()).collect();
+        assert!(keys.contains(&"team_a:user:alice"), "keys: {:?}", keys);
+        assert!(keys.contains(&"team_a:tool:search"), "keys: {:?}", keys);
+    }
+
+    #[test]
+    fn build_checks_with_prefix_includes_tenant_dimension() {
+        init_python();
+        let (clock, _handle) = FakeClock::new(1_000_000);
+        let cfg = EngineConfig {
+            by_user: Some(crate::config::parse_rate("10/s").unwrap()),
+            by_tenant: Some(crate::config::parse_rate("100/s").unwrap()),
+            by_tool: HashMap::new(),
+            algorithm: Algorithm::FixedWindow,
+        };
+        let engine = RateLimiterEngine::new_with_clock(cfg, Arc::new(clock));
+        let checks = engine.build_checks("alice", Some("acme"), "search", Some("team_a"));
+        let keys: Vec<&str> = checks.iter().map(|(k, _, _)| k.as_str()).collect();
+        assert!(keys.contains(&"team_a:user:alice"), "keys: {:?}", keys);
+        assert!(keys.contains(&"team_a:tenant:acme"), "keys: {:?}", keys);
+    }
+
+    #[test]
+    fn different_prefixes_produce_isolated_counters() {
+        let (engine, _handle) = engine_with_fake_clock(Some("2/s"), Algorithm::FixedWindow);
+        // Exhaust limit for team_a
+        let checks_a = || engine.build_checks("alice", None, "search", Some("team_a"));
+        let _ = engine.evaluate_many(checks_a(), 1_000_000).unwrap();
+        let _ = engine.evaluate_many(checks_a(), 1_000_000).unwrap();
+        let result_a = engine.evaluate_many(checks_a(), 1_000_000).unwrap();
+        assert!(
+            !result_a.allowed,
+            "team_a should be blocked after 2 requests"
+        );
+
+        // team_b should still be allowed — different prefix, different counters
+        let checks_b = || engine.build_checks("alice", None, "search", Some("team_b"));
+        let result_b = engine.evaluate_many(checks_b(), 1_000_000).unwrap();
+        assert!(
+            result_b.allowed,
+            "team_b should be allowed — isolated counter"
+        );
+    }
+
+    #[test]
+    fn empty_prefix_matches_no_prefix_behavior() {
+        let (engine, _handle) = engine_with_fake_clock(Some("10/s"), Algorithm::FixedWindow);
+        let checks_none = engine.build_checks("alice", None, "search", None);
+        let checks_empty = engine.build_checks("alice", None, "search", Some(""));
+        // Both should produce the same unprefixed keys
+        assert_eq!(checks_none.len(), checks_empty.len());
+        for ((k1, _, _), (k2, _, _)) in checks_none.iter().zip(checks_empty.iter()) {
+            assert_eq!(k1, k2);
+        }
     }
 }

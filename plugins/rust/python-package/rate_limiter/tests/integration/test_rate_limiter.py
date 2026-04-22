@@ -1041,6 +1041,35 @@ async def _flush_redis(redis_url: str) -> None:
     await client.aclose()
 
 
+async def _keys_in_redis(redis_url: str, pattern: str) -> list[str]:
+    """Return all Redis keys matching the pattern. Used by isolation tests."""
+    # Third-Party
+    import redis.asyncio as aioredis  # noqa: PLC0415
+
+    client = aioredis.from_url(redis_url, decode_responses=True)
+    try:
+        return sorted(await client.keys(pattern))
+    finally:
+        await client.aclose()
+
+
+async def _count_redis_clients(redis_url: str) -> int:
+    """Return the number of connected clients reported by Redis CLIENT LIST.
+
+    Includes the monitoring client we open here, so callers use this as a
+    relative measure (delta before/after an action), not an absolute count.
+    """
+    # Third-Party
+    import redis.asyncio as aioredis  # noqa: PLC0415
+
+    client = aioredis.from_url(redis_url, decode_responses=True)
+    try:
+        listing = await client.execute_command("CLIENT", "LIST")
+        return len([line for line in listing.splitlines() if line.strip()])
+    finally:
+        await client.aclose()
+
+
 class TestRedisBackendIntegration:
     """End-to-end integration tests for the Redis backend.
 
@@ -1256,3 +1285,296 @@ class TestRedisBackendIntegration:
 
         result = await plugin.tool_pre_invoke(payload, ctx)
         assert result.violation is None, "After tokens refill over time, token_bucket Redis backend must allow requests again"
+
+
+class TestRedisTenantIsolation:
+    """Tenant-scoped Redis key isolation (G2).
+
+    Without tenant-scoped keys, the same user hitting two different teams
+    through the same Redis would share a single ``rl:user:alice:*`` counter —
+    Team A's strict limit would poison Team B. The fix prefixes dimension
+    keys with the tenant id so counters are isolated per tenant.
+    """
+
+    @pytest.mark.asyncio
+    async def test_same_user_different_tenants_isolated_in_redis(self, redis_url_for_integration):
+        """Same user, two tenant ids, one Redis → independent per-user counters."""
+        await _flush_redis(redis_url_for_integration)
+
+        plugin = _make_redis_plugin(redis_url_for_integration, limit="3/s")
+        payload = ToolPreInvokePayload(name="tool", arguments={})
+        ctx_team_a = PluginContext(global_context=GlobalContext(request_id="r1", user="alice", tenant_id="team_a"))
+        ctx_team_b = PluginContext(global_context=GlobalContext(request_id="r2", user="alice", tenant_id="team_b"))
+
+        # Exhaust alice's limit under team_a.
+        for _ in range(3):
+            result = await plugin.tool_pre_invoke(payload, ctx_team_a)
+            assert result.violation is None, "team_a: requests within limit must be allowed"
+        blocked = await plugin.tool_pre_invoke(payload, ctx_team_a)
+        assert blocked.violation is not None, "team_a: 4th request must be blocked"
+
+        # Same user under team_b must not be affected.
+        result = await plugin.tool_pre_invoke(payload, ctx_team_b)
+        assert result.violation is None, "team_b: alice must have an independent counter — team_a's limit must not bleed across tenants"
+
+        # Key-shape proof: the two tenants occupy disjoint key namespaces in Redis.
+        keys_team_a = await _keys_in_redis(redis_url_for_integration, "rl:team_a:user:alice:*")
+        keys_team_b = await _keys_in_redis(redis_url_for_integration, "rl:team_b:user:alice:*")
+        assert keys_team_a, f"expected team_a-prefixed key, got none. keys_team_a={keys_team_a}"
+        assert keys_team_b, f"expected team_b-prefixed key, got none. keys_team_b={keys_team_b}"
+        assert set(keys_team_a).isdisjoint(set(keys_team_b)), "team_a and team_b key sets must not overlap"
+
+
+class TestRedisLifecycle:
+    """Plugin-manager lifecycle compliance (G3, G10).
+
+    When the plugin framework disables a plugin it calls ``await plugin.shutdown()``;
+    when it re-enables, a fresh instance is constructed. A compliant Redis-backed
+    plugin must release its cached connection on shutdown so the old instance
+    doesn't leak sockets while the new one opens its own.
+    """
+
+    @pytest.mark.asyncio
+    async def test_initialize_logs_backend(self, redis_url_for_integration, caplog):
+        """plugin.initialize() emits a log record identifying the active backend."""
+        import logging  # noqa: PLC0415
+
+        plugin = _make_redis_plugin(redis_url_for_integration, limit="5/s")
+
+        with caplog.at_level(logging.INFO, logger="cpex_rate_limiter.rate_limiter"):
+            await plugin.initialize()
+
+        matches = [r for r in caplog.records if "initialized" in r.getMessage() and "redis" in r.getMessage()]
+        assert matches, (
+            "plugin.initialize() must log a record mentioning the backend so operators can confirm the plugin is live — "
+            f"captured records: {[r.getMessage() for r in caplog.records]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_shutdown_releases_redis_connection(self, redis_url_for_integration):
+        """After plugin.shutdown(), the Redis connection cached by the Rust core is dropped."""
+        await _flush_redis(redis_url_for_integration)
+
+        plugin = _make_redis_plugin(redis_url_for_integration, limit="5/s")
+        ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
+        payload = ToolPreInvokePayload(name="tool", arguments={})
+
+        # Warm the connection — the Rust core opens Redis lazily on first request.
+        await plugin.tool_pre_invoke(payload, ctx)
+
+        clients_before = await _count_redis_clients(redis_url_for_integration)
+
+        await plugin.shutdown()
+
+        # Allow the TCP close to propagate to the server's client list.
+        await asyncio.sleep(0.2)
+        clients_after = await _count_redis_clients(redis_url_for_integration)
+
+        assert clients_after < clients_before, (
+            "plugin.shutdown() must release the Rust core's cached Redis connection — "
+            f"expected fewer clients after shutdown, got before={clients_before} after={clients_after}"
+        )
+
+
+def _make_redis_plugin_with_config(redis_url: str, extra_config: dict) -> RateLimiterPlugin:
+    """Redis-backed plugin with caller-supplied extra config keys (e.g. fail_mode)."""
+    base = {
+        "by_user": "3/s",
+        "backend": "redis",
+        "redis_url": redis_url,
+        "algorithm": "fixed_window",
+    }
+    base.update(extra_config)
+    return RateLimiterPlugin(
+        PluginConfig(
+            name="RateLimiter",
+            kind="cpex_rate_limiter.rate_limiter.RateLimiterPlugin",
+            hooks=["tool_pre_invoke"],
+            priority=100,
+            config=base,
+        )
+    )
+
+
+# A Redis URL that parses fine but points at a port where nothing listens.
+# Used by fail-mode tests to trigger a backend error deterministically
+# without depending on Docker being slow or flaky.
+_DEAD_REDIS_URL = "redis://127.0.0.1:1/15"
+
+
+class TestRedisFailModeAndViolationContext:
+    """Fail-mode policy and violation context (G4, G7, G8, G14).
+
+    When the Redis backend is unreachable, the plugin must either fail open
+    (default) or fail closed (opt-in via fail_mode="closed") — and in both
+    cases an operator-visible log record must describe what happened. When
+    the plugin blocks a request the violation must carry enough context
+    (tenant_id, user_id) for downstream debugging.
+    """
+
+    @pytest.mark.asyncio
+    async def test_redis_unreachable_default_fail_open_logs_warning(self, caplog):
+        """Unreachable backend + default fail_mode: request is allowed AND a WARNING is logged."""
+        import logging  # noqa: PLC0415
+
+        plugin = RateLimiterPlugin(
+            PluginConfig(
+                name="RateLimiter",
+                kind="cpex_rate_limiter.rate_limiter.RateLimiterPlugin",
+                hooks=["tool_pre_invoke"],
+                priority=100,
+                config={"by_user": "3/s", "backend": "redis", "redis_url": _DEAD_REDIS_URL},
+            )
+        )
+        ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
+        payload = ToolPreInvokePayload(name="tool", arguments={})
+
+        with caplog.at_level(logging.WARNING, logger="cpex_rate_limiter.rate_limiter"):
+            result = await plugin.tool_pre_invoke(payload, ctx)
+
+        assert result.violation is None, "default fail_mode=open: unreachable backend must not block"
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings, (
+            "backend failures must be logged at WARNING or higher so operators notice silent fail-open — "
+            f"captured records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_redis_unreachable_fail_mode_closed_blocks(self):
+        """fail_mode=closed: unreachable backend blocks the request with BACKEND_UNAVAILABLE."""
+        plugin = _make_redis_plugin_with_config(_DEAD_REDIS_URL, {"fail_mode": "closed"})
+        ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
+        payload = ToolPreInvokePayload(name="tool", arguments={})
+
+        result = await plugin.tool_pre_invoke(payload, ctx)
+
+        assert result.violation is not None, "fail_mode=closed must block when the backend is unreachable"
+        assert result.violation.code == "BACKEND_UNAVAILABLE", (
+            f"expected code=BACKEND_UNAVAILABLE, got {result.violation.code!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_violation_details_includes_tenant_and_user(self, redis_url_for_integration):
+        """Blocked requests carry tenant_id + user_id in violation.details for downstream debugging."""
+        await _flush_redis(redis_url_for_integration)
+
+        plugin = _make_redis_plugin(redis_url_for_integration, limit="2/s")
+        ctx = PluginContext(
+            global_context=GlobalContext(request_id="r1", user="alice@example.com", tenant_id="team_a")
+        )
+        payload = ToolPreInvokePayload(name="tool", arguments={})
+
+        await plugin.tool_pre_invoke(payload, ctx)
+        await plugin.tool_pre_invoke(payload, ctx)
+        blocked = await plugin.tool_pre_invoke(payload, ctx)
+
+        assert blocked.violation is not None, "3rd request must be blocked"
+        details = blocked.violation.details or {}
+        assert details.get("tenant_id") == "team_a", (
+            f"violation.details must carry tenant_id; got details={details!r}"
+        )
+        assert details.get("user_id") == "alice@example.com", (
+            f"violation.details must carry user_id; got details={details!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_invalid_fail_mode_logs_warning_and_defaults_open(self, redis_url_for_integration, caplog):
+        """Typos like 'clsoed' must WARN and default to fail-open, not silently disable.
+
+        Before the strict parser, anything that didn't case-insensitively
+        equal 'closed' silently became fail-open — including obvious
+        typos — which undermined the point of having a fail-closed knob.
+        Operators get no signal that their configured policy isn't the
+        one being applied. After the fix, unknown values are rejected
+        with a WARN log so the typo surfaces at init time.
+        """
+        import logging  # noqa: PLC0415
+
+        with caplog.at_level(logging.WARNING):
+            plugin = _make_redis_plugin_with_config(redis_url_for_integration, {"fail_mode": "clsoed"})
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and "fail_mode" in r.getMessage()
+            and "clsoed" in r.getMessage()
+        ]
+        assert warnings, (
+            "invalid fail_mode must emit a WARN naming both the field and the bad value; "
+            f"captured records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+        )
+
+        # Behaviour: fall back to fail-open (not fail-closed, not crash).
+        ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
+        payload = ToolPreInvokePayload(name="tool", arguments={})
+        # Deliberately hit the happy path — limit is 3/s, one request stays well under.
+        result = await plugin.tool_pre_invoke(payload, ctx)
+        assert result.violation is None, "invalid fail_mode must default to fail-open, not block"
+
+    @pytest.mark.asyncio
+    async def test_allowed_request_metadata_does_not_carry_identity(self, redis_url_for_integration):
+        """Allowed responses must NOT carry user_id / tenant_id in metadata.
+
+        Identity fields belong on the block path (violation.details) so
+        operators can see who triggered a 429. Exposing them on every
+        allowed response widens identity leak surface to downstream
+        consumers that inspect plugin metadata and bloats the hot path
+        with data no caller needs.
+        """
+        await _flush_redis(redis_url_for_integration)
+
+        plugin = _make_redis_plugin(redis_url_for_integration, limit="5/s")
+        ctx = PluginContext(
+            global_context=GlobalContext(request_id="r1", user="alice@example.com", tenant_id="team_a")
+        )
+        payload = ToolPreInvokePayload(name="tool", arguments={})
+
+        result = await plugin.tool_pre_invoke(payload, ctx)
+
+        assert result.violation is None, "request under limit must be allowed"
+        metadata = result.metadata or {}
+        assert "user_id" not in metadata, (
+            f"allowed response must not carry user_id in metadata; got metadata={metadata!r}"
+        )
+        assert "tenant_id" not in metadata, (
+            f"allowed response must not carry tenant_id in metadata; got metadata={metadata!r}"
+        )
+
+
+class TestConfigHardening:
+    """Config hardening (G13, G15).
+
+    The plugin must reject obviously-misconfigured rate strings and warn
+    when the operator passes a key the engine doesn't understand (typos
+    surface visibly instead of silently being ignored).
+    """
+
+    @pytest.mark.asyncio
+    async def test_unknown_config_key_emits_warning(self, redis_url_for_integration, caplog):
+        """Misspelled config keys (e.g. 'redis_ur') log a WARNING so the operator notices."""
+        import logging  # noqa: PLC0415
+
+        with caplog.at_level(logging.WARNING):
+            RateLimiterPlugin(
+                PluginConfig(
+                    name="RateLimiter",
+                    kind="cpex_rate_limiter.rate_limiter.RateLimiterPlugin",
+                    hooks=["tool_pre_invoke"],
+                    priority=100,
+                    config={
+                        "by_user": "3/s",
+                        "backend": "redis",
+                        "redis_url": redis_url_for_integration,
+                        "redis_ur": "typo-key",  # misspelled
+                    },
+                )
+            )
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and "redis_ur" in r.getMessage()
+        ]
+        assert warnings, (
+            "engine must warn on unknown config keys so misspellings are visible — "
+            f"captured records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+        )
