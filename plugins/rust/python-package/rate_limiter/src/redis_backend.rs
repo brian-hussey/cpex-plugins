@@ -16,10 +16,12 @@
 use std::cmp::max;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use redis::aio::MultiplexedConnection;
 use tokio::runtime::{Builder, Runtime};
+use tokio::time::timeout;
 
 use crate::config::Algorithm;
 use crate::types::DimResult;
@@ -219,7 +221,43 @@ impl RedisRateLimiter {
             }
         }
 
-        let conn = self.client.get_multiplexed_tokio_connection().await?;
+        // Bound the connection-acquisition.  Without this, a Redis endpoint
+        // that accepts TCP but never responds at the application layer
+        // (plain ``redis://`` against a TLS-required server, a network ACL
+        // dropping post-handshake bytes, etc.) hangs the call indefinitely;
+        // the existing fail_mode path cannot engage because the call never
+        // returns to surface an error.  Mapping the timeout into a
+        // RedisError lets the caller's fail_mode logic route this exactly
+        // like any other connection-side failure.
+        //
+        // Hardcoded rather than promoted to a config key to keep the
+        // plugin's config surface small — operators rarely tune this knob
+        // and adding it for the few who might need it expands the schema
+        // for everyone else.  Two seconds is comfortable headroom for
+        // typical production paths (intra-VPC and cross-AZ Redis well
+        // under 100 ms; managed Redis with TLS handshake adds ~100-300 ms
+        // on top).  If a deployment with deliberately slow networks
+        // surfaces and 2 s becomes too tight, promote this into the
+        // ``lib.rs`` defaults + the engine's KNOWN config-key list — the
+        // existing config-validation machinery (defaults, unknown-key
+        // warning) handles the rest cleanly.
+        const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+        let conn = timeout(
+            CONNECT_TIMEOUT,
+            self.client.get_multiplexed_tokio_connection(),
+        )
+        .await
+        .map_err(|_elapsed| {
+            redis::RedisError::from((
+                redis::ErrorKind::IoError,
+                "connection timeout",
+                format!(
+                    "redis connection acquisition exceeded {:?}",
+                    CONNECT_TIMEOUT,
+                ),
+            ))
+        })??;
+
         let mut conn_guard = self.conn.lock();
         if let Some(existing) = conn_guard.as_ref() {
             return Ok(existing.clone());
@@ -542,6 +580,85 @@ impl RedisRateLimiter {
 #[cfg(test)]
 mod tests {
     use super::RedisRateLimiter;
+    use crate::config::Algorithm;
+    use std::time::{Duration, Instant};
+
+    /// `connection_async` must time out within a bounded window when the
+    /// Redis endpoint accepts TCP but never speaks at the application layer.
+    ///
+    /// Test setup: bind a TCP listener but never call `accept()` to read or
+    /// write any bytes.  The kernel completes the TCP three-way handshake
+    /// into its accept queue; the redis crate's
+    /// `get_multiplexed_tokio_connection` sends its initial handshake bytes
+    /// and waits for a response that never comes.
+    ///
+    /// The outer `tokio::time::timeout(5s)` is the test's runaway-guard so
+    /// a regression doesn't hang the test run.  Asserts:
+    ///   * `connection_async` returns within ~3 seconds (well under the
+    ///     5s guard).
+    ///   * The returned error is `IoError`-shaped, so the existing
+    ///     `fail_mode` path can route it the same way as any other
+    ///     connection-side failure.
+    #[test]
+    fn connection_async_fails_fast_against_hanging_redis() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let hang_addr = listener.local_addr().expect("local_addr").to_string();
+        let url = format!("redis://{}/0", hang_addr);
+
+        let limiter = RedisRateLimiter::new(&url, Algorithm::FixedWindow, "rl".to_string())
+            .expect("client should construct (lazy connection)");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        let started = Instant::now();
+        let result: Result<Result<_, redis::RedisError>, tokio::time::error::Elapsed> = runtime
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), limiter.connection_async()).await
+            });
+        let elapsed = started.elapsed();
+
+        // The outer 5s tokio::time::timeout is the test's runaway-guard.
+        // It firing is the bug shape (hang).  We want the inner Result
+        // to be available — i.e., connection_async must have returned of
+        // its own accord well before 5s.
+        let inner = result.expect(
+            "connection_async hung against a TCP-accepted-but-app-hangs Redis — \
+             expected an explicit connection timeout error from the redis client \
+             well before the 5s test bound; instead the call never returned.",
+        );
+
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "connection_async must fail fast on a hanging Redis (≤3s) — took {:?}. \
+             Without a connection time-bound, the existing fail_mode path can't \
+             trigger because the call never returns at all.",
+            elapsed,
+        );
+
+        let err = inner.expect_err(
+            "connection_async should error against a hanging Redis (server never \
+             completes the redis handshake), not return Ok",
+        );
+        // Pin the exact contract: the connection-acquisition timeout maps
+        // into ``redis::ErrorKind::IoError``, the same shape the existing
+        // ``fail_mode`` path routes for any other connection-side failure.
+        // Anything else (ResponseError, ClientError, ...) would mean the
+        // timeout is being surfaced through a different code path than
+        // the rest of the fail-mode logic and would silently break the
+        // operator's fail-open / fail-closed policy.
+        assert_eq!(
+            err.kind(),
+            redis::ErrorKind::IoError,
+            "expected IoError-shaped timeout error from connection_async; got {:?}: {}",
+            err.kind(),
+            err,
+        );
+    }
 
     #[test]
     fn token_bucket_success_reset_uses_time_to_full() {
