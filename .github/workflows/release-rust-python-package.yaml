@@ -33,7 +33,6 @@ on:
         options:
           - testpypi
           - pypi
-
 permissions:
   contents: read
 
@@ -220,6 +219,7 @@ jobs:
             cp -R "${GITHUB_WORKSPACE}/plugins/tests/${{ needs.resolve.outputs.slug }}" "${tmpdir}/tests/${{ needs.resolve.outputs.slug }}"
             cp "${GITHUB_WORKSPACE}/plugins/tests/conftest.py" "${tmpdir}/tests/conftest.py"
             cp "${GITHUB_WORKSPACE}/plugins/tests/plugin_hooks.py" "${tmpdir}/tests/plugin_hooks.py"
+            cp "${GITHUB_WORKSPACE}/plugins/tests/real_cpex_imports.py" "${tmpdir}/tests/real_cpex_imports.py"
             cp "${GITHUB_WORKSPACE}/plugins/tests/pytest.ini" "${tmpdir}/pytest.ini"
             cd "${tmpdir}"
             export CPEX_TEST_PLUGIN_HOOKS=1
@@ -273,6 +273,7 @@ jobs:
             cp -R "${GITHUB_WORKSPACE}/plugins/tests/${{ needs.resolve.outputs.slug }}" "${tmpdir}/tests/${{ needs.resolve.outputs.slug }}"
             cp "${GITHUB_WORKSPACE}/plugins/tests/conftest.py" "${tmpdir}/tests/conftest.py"
             cp "${GITHUB_WORKSPACE}/plugins/tests/plugin_hooks.py" "${tmpdir}/tests/plugin_hooks.py"
+            cp "${GITHUB_WORKSPACE}/plugins/tests/real_cpex_imports.py" "${tmpdir}/tests/real_cpex_imports.py"
             cp "${GITHUB_WORKSPACE}/plugins/tests/pytest.ini" "${tmpdir}/pytest.ini"
             cd "${tmpdir}"
             export CPEX_TEST_PLUGIN_HOOKS=1

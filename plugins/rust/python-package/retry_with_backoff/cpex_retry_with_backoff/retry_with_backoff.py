@@ -13,8 +13,8 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
-from mcpgateway.config import get_settings
-from mcpgateway.plugins.framework import (
+from cpex.framework.settings import get_settings
+from cpex.framework import (
     Plugin,
     PluginConfig,
     PluginContext,
@@ -27,7 +27,6 @@ from mcpgateway.plugins.framework import (
 from cpex_retry_with_backoff.retry_with_backoff_rust import RetryStateManager
 
 log = logging.getLogger(__name__)
-_RUST_AVAILABLE = True
 
 
 @dataclass
@@ -130,7 +129,7 @@ class RetryWithBackoffPlugin(Plugin):
         super().__init__(config)
         raw_cfg = RetryConfig(**(config.config or {}))
 
-        ceiling = get_settings().max_tool_retries
+        ceiling = getattr(get_settings(), "max_tool_retries", raw_cfg.max_retries)
         if raw_cfg.max_retries > ceiling:
             log.warning(
                 "retry_with_backoff: max_retries=%d exceeds gateway ceiling=%d, clamping",
@@ -205,7 +204,7 @@ class RetryWithBackoffPlugin(Plugin):
             }
         }
 
-        if self._rust is not None and not cfg.check_text_content:
+        if not cfg.check_text_content:
             is_error = isinstance(result, dict) and result.get("isError") is True
             status_code: int | None = None
             if isinstance(result, dict):
